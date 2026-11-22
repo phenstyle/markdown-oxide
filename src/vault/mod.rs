@@ -610,12 +610,25 @@ pub trait Rangeable {
                     && self_range.end.character >= other_range.end.character))
     }
 
+    fn overlaps(&self, other: &impl Rangeable) -> bool {
+        let self_range = self.range();
+        let other_range = other.range();
+
+        self_range.start < other_range.end && other_range.start < self_range.end
+    }
+
     fn includes_position(&self, position: Position) -> bool {
         let range = self.range();
         (range.start.line < position.line
             || (range.start.line == position.line && range.start.character <= position.character))
             && (range.end.line > position.line
                 || (range.end.line == position.line && range.end.character >= position.character))
+    }
+}
+
+impl Rangeable for MyRange {
+    fn range(&self) -> &MyRange {
+        self
     }
 }
 
@@ -655,6 +668,142 @@ impl Rangeable for Reference {
     }
 }
 
+fn pos_to_char(rope: &Rope, pos: Position) -> Option<usize> {
+    let line = pos.line as usize;
+    if line >= rope.len_lines() {
+        return None;
+    }
+    let ch = rope
+        .line_to_char(line)
+        .checked_add(pos.character as usize)?;
+    (ch <= rope.len_chars()).then_some(ch)
+}
+
+fn non_empty_char_range(rope: &Rope, start: usize, end: usize) -> Option<MyRange> {
+    (start < end && end <= rope.len_chars()).then(|| MyRange::from_char_range(rope, start..end))
+}
+
+/// Returns up to two subranges within `reference` where single-line inline code spans
+/// are valid Markdown syntax (link display text, `#heading` fragments, and `LinkRef` inner labels).
+fn reference_allowed_inline_code_ranges(
+    reference: &Reference,
+    rope: &Rope,
+) -> [Option<MyRange>; 2] {
+    let mut allowed = [None, None];
+    let Some(ref_start) = pos_to_char(rope, reference.range.start) else {
+        return allowed;
+    };
+    let Some(ref_end) = pos_to_char(rope, reference.range.end) else {
+        return allowed;
+    };
+
+    match reference {
+        MDFileLink(_) | MDHeadingLink(..) | MDIndexedBlockLink(..) => {
+            if let Some(display) = reference.display_text.as_deref().filter(|d| !d.is_empty()) {
+                if let Some(disp_start) = ref_start.checked_add(1) {
+                    if let Some(disp_end) = disp_start.checked_add(display.chars().count()) {
+                        if disp_end <= ref_end {
+                            allowed[0] = non_empty_char_range(rope, disp_start, disp_end);
+                        }
+                    }
+                }
+            }
+            if let MDHeadingLink(_, _, heading) = reference {
+                if !heading.is_empty() {
+                    // MD_LINK_RE ends with `)` or `>)` when angle-bracketed.
+                    let before_paren = ref_end.checked_sub(1);
+                    let frag_end = before_paren.and_then(|bp| {
+                        if bp > 0 && rope.char(bp - 1) == '>' {
+                            bp.checked_sub(1)
+                        } else {
+                            Some(bp)
+                        }
+                    });
+                    if let Some(frag_end) = frag_end {
+                        if let Some(frag_start) = frag_end.checked_sub(heading.chars().count()) {
+                            if frag_start >= ref_start {
+                                allowed[1] = non_empty_char_range(rope, frag_start, frag_end);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        WikiFileLink(_) | WikiHeadingLink(..) | WikiIndexedBlockLink(..) => {
+            let display_suffix_chars = match reference.display_text.as_deref() {
+                Some(display) if !display.is_empty() => {
+                    let count = display.chars().count();
+                    if let Some(disp_end) = ref_end.checked_sub(2) {
+                        if let Some(disp_start) = disp_end.checked_sub(count) {
+                            if disp_start >= ref_start {
+                                allowed[0] = non_empty_char_range(rope, disp_start, disp_end);
+                            }
+                        }
+                    }
+                    count.saturating_add(1) // includes leading '|'
+                }
+                _ => 0,
+            };
+            if let WikiHeadingLink(_, _, heading) = reference {
+                if !heading.is_empty() {
+                    if let Some(frag_end) = ref_end
+                        .checked_sub(2)
+                        .and_then(|e| e.checked_sub(display_suffix_chars))
+                    {
+                        if let Some(frag_start) = frag_end.checked_sub(heading.chars().count()) {
+                            if frag_start >= ref_start {
+                                allowed[1] = non_empty_char_range(rope, frag_start, frag_end);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        LinkRef(_) => {
+            if let (Some(inner_start), Some(inner_end)) =
+                (ref_start.checked_add(1), ref_end.checked_sub(1))
+            {
+                allowed[0] = non_empty_char_range(rope, inner_start, inner_end);
+            }
+        }
+        _ => {}
+    }
+
+    allowed
+}
+
+fn reference_excluded_by_codeblocks(
+    reference: &Reference,
+    code_blocks: &[MDCodeBlock],
+    rope: &Rope,
+) -> bool {
+    let mut allowed_ranges: Option<[Option<MyRange>; 2]> = None;
+
+    for codeblock in code_blocks {
+        if !codeblock.overlaps(reference) {
+            continue;
+        }
+
+        // Only single-line inline code spans strictly inside an allowed subrange are permitted;
+        // multi-line fenced code blocks or spans touching link syntax always exclude the reference.
+        if codeblock.range().start.line == codeblock.range().end.line {
+            let ranges = allowed_ranges
+                .get_or_insert_with(|| reference_allowed_inline_code_ranges(reference, rope));
+            if ranges
+                .iter()
+                .flatten()
+                .any(|allowed| allowed.includes(codeblock))
+            {
+                continue;
+            }
+        }
+
+        return true;
+    }
+
+    false
+}
+
 #[derive(Debug, PartialEq, Eq, Default, Hash, Clone)]
 pub struct MDFile {
     pub references: Vec<Reference>,
@@ -681,9 +830,12 @@ impl MDFile {
             Settings {
                 references_in_codeblocks: false,
                 ..
-            } => Reference::new(text, file_name)
-                .filter(|it| !code_blocks.iter().any(|codeblock| codeblock.includes(it)))
-                .collect_vec(),
+            } if !code_blocks.is_empty() => {
+                let rope = Rope::from_str(text);
+                Reference::new(text, file_name)
+                    .filter(|it| !reference_excluded_by_codeblocks(it, &code_blocks, &rope))
+                    .collect_vec()
+            }
             _ => Reference::new(text, file_name).collect_vec(),
         };
         let headings = MDHeading::new(text)
@@ -1249,11 +1401,15 @@ impl MyRange {
         let char_start = rope.byte_to_char(range.start);
         let char_end = rope.byte_to_char(range.end);
 
-        let start_line = rope.char_to_line(char_start);
-        let start_offset = char_start - rope.line_to_char(start_line);
+        Self::from_char_range(rope, char_start..char_end)
+    }
 
-        let end_line = rope.char_to_line(char_end);
-        let end_offset = char_end - rope.line_to_char(end_line);
+    pub fn from_char_range(rope: &Rope, range: Range<usize>) -> MyRange {
+        let start_line = rope.char_to_line(range.start);
+        let start_offset = range.start - rope.line_to_char(start_line);
+
+        let end_line = rope.char_to_line(range.end);
+        let end_offset = range.end - rope.line_to_char(end_line);
 
         tower_lsp::lsp_types::Range {
             start: Position {
@@ -3432,5 +3588,153 @@ Some content here";
         })];
 
         assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn issue_269_separate_inline_code_brackets_not_reference() {
+        let text = "* DO NOT use the square bracket `[[` and `]]` markers";
+        let parsed = MDFile::new(&test_settings(), text, PathBuf::from("test.md"));
+
+        assert!(
+            parsed.references.is_empty(),
+            "expected no references, got {:?}",
+            parsed.references
+        );
+
+        let mixed = "See [[real-note]] and avoid `[[` and `]]` or ``[[`` and ``]]`` markers";
+        let parsed_mixed = MDFile::new(&test_settings(), mixed, PathBuf::from("test.md"));
+        let ref_texts: Vec<&str> = parsed_mixed
+            .references
+            .iter()
+            .map(|r| r.data().reference_text.as_str())
+            .collect();
+        assert_eq!(ref_texts, vec!["real-note"]);
+    }
+
+    #[test]
+    fn issue_269_partial_code_overlap_and_fenced_span_dropped() {
+        let cases = [
+            "Opening in code: `[[` foo ]]",
+            "Closing in code: [[ foo `]]`",
+            "Code in wikilink target: [[foo`bar`baz]]",
+            "Code in wikilink file before heading: [[`test`#Heading]]",
+            "Pipe with bracket in code: `[[` foo | bar `]]`",
+            "Code in markdown destination: [foo](`target.md`)",
+            "Code in markdown file before heading: [foo](`target.md`#Heading)",
+            "Spans fenced block:\n[[foo\n```\nbar\n```\nbaz]]",
+            "Valid-looking link inside fenced block:\n```markdown\n[see `code` docs](target.md)\n```",
+        ];
+
+        for text in cases {
+            let parsed = MDFile::new(&test_settings(), text, PathBuf::from("test.md"));
+            assert!(
+                parsed.references.is_empty(),
+                "expected no references for {text:?}, got {:?}",
+                parsed.references
+            );
+        }
+    }
+
+    #[test]
+    fn issue_269_preserves_valid_links_with_code_in_display_or_adjacent() {
+        let text = "\
+# Heading with `code`
+
+Adjacent before `code`[[real-note]] and after [[other-note]]`code`.
+Markdown display code: [see `code` docs](target.md) and [`MyStruct`](struct.md).
+Multiline display code: [see\n`code`\ndocs](multiline-target.md).
+UTF-8 markdown display code: [🚀 `code` docs](utf8-target.md).
+Wikilink display code: [[wiki-target|`code`]] and [[wiki-utf8|🚀 `code`]].
+";
+        let parsed = MDFile::new(&test_settings(), text, PathBuf::from("test.md"));
+
+        let ref_texts: Vec<&str> = parsed
+            .references
+            .iter()
+            .map(|r| r.data().reference_text.as_str())
+            .collect();
+
+        assert_eq!(
+            ref_texts,
+            vec![
+                "real-note",
+                "other-note",
+                "wiki-target",
+                "wiki-utf8",
+                "target",
+                "struct",
+                "multiline-target",
+                "utf8-target",
+            ]
+        );
+        assert_eq!(parsed.headings.len(), 1);
+        assert_eq!(parsed.headings[0].heading_text, "Heading with `code`");
+    }
+
+    #[test]
+    fn issue_269_preserves_heading_links_with_inline_code() {
+        let text = "\
+# Heading with `code`
+
+- [[#Heading with `code`]]
+- [[test#Heading with `code`]]
+- [[test#Heading with `code`|`alias`]]
+- [docs](<test.md#Heading with `code`>)
+- [docs](#Heading-with-`code`)
+";
+        let parsed = MDFile::new(&test_settings(), text, PathBuf::from("test.md"));
+
+        let ref_texts: Vec<&str> = parsed
+            .references
+            .iter()
+            .map(|r| r.data().reference_text.as_str())
+            .collect();
+
+        assert_eq!(
+            ref_texts,
+            vec![
+                "test#Heading with `code`",
+                "test#Heading with `code`",
+                "test#Heading with `code`",
+                "test#Heading with `code`",
+                "test#Heading-with-`code`",
+            ]
+        );
+    }
+
+    #[test]
+    fn issue_269_preserves_inline_code_link_refs_only_when_unwrapped() {
+        let text = "\
+See [`MyStruct`] here.
+Do not link `[MyStruct]` or `[`MyStruct`]`.
+
+[`MyStruct`]: https://example.com
+";
+        let parsed = MDFile::new(&test_settings(), text, PathBuf::from("test.md"));
+
+        let link_refs: Vec<&str> = parsed
+            .references
+            .iter()
+            .filter_map(|r| match r {
+                LinkRef(data) => Some(data.reference_text.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(link_refs, vec!["`MyStruct`"]);
+    }
+
+    #[test]
+    fn issue_269_references_in_codeblocks_setting_preserved() {
+        let mut settings = test_settings();
+        settings.references_in_codeblocks = true;
+
+        let text = "Inside inline code: `[[inside-code]]`";
+        let parsed = MDFile::new(&settings, text, PathBuf::from("test.md"));
+
+        assert!(parsed
+            .references
+            .iter()
+            .any(|r| { matches!(r, WikiFileLink(data) if data.reference_text == "inside-code") }));
     }
 }
